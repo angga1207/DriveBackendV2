@@ -45,8 +45,12 @@ class TransferLocalFileToGoogle implements ShouldQueue
         }
 
         if (!file_exists($filePath)) {
-            Log::warning('JOB : File tidak ditemukan di lokal, data akan di force delete. Path: ' . $filePath . ' | Data ID: ' . $data->id);
-            $data->forceDelete();
+            Log::warning('JOB : File tidak ditemukan di lokal, data tidak di-delete. Set skip_upload_to_google=true. Path: ' . $filePath . ' | Data ID: ' . $data->id);
+
+            // Jangan forceDelete karena ini bisa bikin job lain (atau upload chunk) kehilangan record Data (FK cascade).
+            // Worker nanti bisa retry job/flow yang sama setelah file tersedia.
+            $data->update(['skip_upload_to_google' => true]);
+
             return;
         }
 

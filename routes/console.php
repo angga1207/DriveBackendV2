@@ -9,6 +9,7 @@ $schedule = app(\Illuminate\Console\Scheduling\Schedule::class);
 
 $schedule->call(function () {
     // Log::info('SCHEDULER : Mengecek antrian job TransferLocalFileToGoogle.');
+    Log::info('PHP VERSION : ' . phpversion());
 
     $currentJobsDataIds = [];
     $currentJobs =
