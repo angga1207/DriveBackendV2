@@ -156,7 +156,7 @@ class UploadController extends Controller
                 $data->size = $file->getSize();
                 $data->extension = $file->getClientOriginalExtension();
                 $data->mimes = $file->getMimeType();
-                $data->skip_upload_to_google = true;
+                $data->skip_upload_to_google = false;
 
                 $tempFileName = time() . $key . '.' . $file->getClientOriginalExtension();
                 File::copy($file->getRealPath(), public_path() . '/storage/temp/' . $tempFileName);
@@ -500,7 +500,8 @@ class UploadController extends Controller
             $data->size = $fileSize;
             $data->extension = $extension;
             $data->mimes = $mimes;
-            $data->skip_upload_to_google = false;
+            // prevent scheduler/job from deleting temp placeholder while chunks are still uploading
+            $data->skip_upload_to_google = true;
 
             // Reserve temp_path so MyDriveSize ignores it (temp_path not null)
             $tempDir = public_path() . '/storage/temp';
@@ -586,6 +587,13 @@ class UploadController extends Controller
             ->where('chunk_id', $chunkId)
             ->first();
 
+        // Fallback: if chunk_id mismatched, try by data_id as well (prevents "not found" on last part)
+        if (!$session) {
+            $session = \App\Models\UploadChunkSession::where('user_id', auth()->id())
+                ->where('data_id', $dataId)
+                ->first();
+        }
+
         if (!$session) {
             return $this->errorResponse('Chunk session not found', 200);
         }
@@ -643,6 +651,13 @@ class UploadController extends Controller
         $session = \App\Models\UploadChunkSession::where('user_id', auth()->id())
             ->where('chunk_id', $chunkId)
             ->first();
+
+        // Fallback: if chunk_id mismatched, try by data_id as well
+        if (!$session) {
+            $session = \App\Models\UploadChunkSession::where('user_id', auth()->id())
+                ->where('data_id', $dataId)
+                ->first();
+        }
 
         if (!$session) {
             return $this->errorResponse('Chunk session not found', 200);

@@ -79,6 +79,13 @@ $schedule->call(function () {
         // ->where('size', '<', 50000000)
         ->whereNull('deleted_at')
         ->where('skip_upload_to_google', true)
+        // JANGAN reset placeholder upload-chunk yang masih aktif
+        // (kalau tidak, TransferLocalFileToGoogle bisa forceDelete Data saat part masih belum selesai)
+        ->whereNotIn('id', function ($q) {
+            $q->select('data_id')
+                ->from('upload_chunk_sessions')
+                ->whereIn('status', ['pending', 'processing']);
+        })
         ->oldest('created_at')
         ->withTrashed()
         ->get();
@@ -90,7 +97,7 @@ $schedule->call(function () {
 
     foreach ($datas as $data) {
         $data->update(['skip_upload_to_google' => false]);
-        // Log::info('SCHEDULER : Reset skip_upload_to_google untuk Data ID: ' . $data->id . ' | File: ' . $data->name);
+        // Log::info('SCHEDULER : Reset skip_upload_to_google untuk Data ID: ' . $data->id);
     }
 
     Log::info('SCHEDULER : Reset skip_upload_to_google untuk ' . $datas->count() . ' data.');
