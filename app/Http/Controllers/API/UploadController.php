@@ -583,6 +583,13 @@ class UploadController extends Controller
             ->where('chunk_id', $chunkId)
             ->first();
 
+        // Fallback: if data_id mismatched, try by chunk_id only
+        if (!$session) {
+            $session = \App\Models\UploadChunkSession::where('user_id', auth()->id())
+                ->where('chunk_id', $chunkId)
+                ->first();
+        }
+
         if (!$session) {
             return $this->errorResponse('Chunk session not found', 200);
         }
@@ -642,11 +649,21 @@ class UploadController extends Controller
             ->where('chunk_id', $chunkId)
             ->first();
 
+        // Fallback: if data_id mismatched, try by chunk_id only
+        if (!$session) {
+            $session = \App\Models\UploadChunkSession::where('user_id', auth()->id())
+                ->where('chunk_id', $chunkId)
+                ->first();
+        }
+
         if (!$session) {
             return $this->errorResponse('Chunk session not found', 200);
         }
 
-        $data = Data::where('user_id', auth()->id())->where('id', $dataId)->first();
+        // If session exists but data_id mismatched, trust session->data_id
+        $resolvedDataId = (int) ($session->data_id ?? $dataId);
+
+        $data = Data::where('user_id', auth()->id())->where('id', $resolvedDataId)->first();
         if (!$data) {
             return $this->errorResponse('Data not found', 200);
         }
