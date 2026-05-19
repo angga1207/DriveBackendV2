@@ -74,27 +74,12 @@ class TransferLocalFileToGoogle implements ShouldQueue
                 $googleUpload = Storage::disk('google')->putFileAs($gdPath, new File($filePath), $fileName, 'public');
             }
 
-            $disk = Storage::disk('google');
+            // Cara ambil Google Drive ID: pakai listContents seperti versi awal (runtime adapter mendukungnya)
+            $gdFiles = collect(Storage::disk('google')->listContents($gdPath, true));
+            $uploaded = $gdFiles->where('path', $googleUpload)->first();
 
-            // Ambil metadata langsung untuk mendapatkan Google Drive file id,
-            // tanpa memanggil listContents().
-            $meta = $disk->getMetadata($googleUpload);
-
-            // Laravel biasanya mengembalikan array, tapi kita buat defensif.
-            $extraMetadata = [];
-            if (is_array($meta) && isset($meta['extraMetadata']) && is_array($meta['extraMetadata'])) {
-                $extraMetadata = $meta['extraMetadata'];
-            } elseif (is_array($meta) && isset($meta['extra_metadata']) && is_array($meta['extra_metadata'])) {
-                // beberapa adapter bisa memakai key berbeda
-                $extraMetadata = $meta['extra_metadata'];
-            } elseif (is_object($meta) && method_exists($meta, 'extraMetadata')) {
-                $extraMetadata = $meta->extraMetadata();
-            }
-
-            $googleDriveId = $extraMetadata['id'] ?? null;
-
-            if ($googleDriveId) {
-                $data->path = $googleDriveId;
+            if ($uploaded) {
+                $data->path = $uploaded['extraMetadata']['id'];
                 $data->gd_folder = $gdFolder;
                 $data->temp_path = null;
                 $data->upload_batch_id = null;
@@ -113,11 +98,11 @@ class TransferLocalFileToGoogle implements ShouldQueue
                     }
                 }
 
-                Log::info('JOB : Upload berhasil. Data ID: ' . $data->id . ' | Google Drive ID: ' . $googleDriveId . ' | Slug: ' . $data->slug . ' | Parent Slug: ' . ($data->parent->slug ?? $data->parent_id));
+                Log::info('JOB : Upload berhasil. Data ID: ' . $data->id . ' | Google Drive ID: ' . $uploaded['extraMetadata']['id'] . ' | Slug: ' . $data->slug . ' | Parent Slug: ' . ($data->parent->slug ?? $data->parent_id));
             } else {
                 DB::rollBack();
-                Log::error('JOB : Upload gagal, metadata Google Drive tidak ditemukan setelah upload. Data ID: ' . $data->id . ' | Path: ' . $googleUpload);
-                Log::info('JOB : getMetadata result (debug): ' . json_encode($meta));
+                Log::error('JOB : Upload gagal, file tidak ditemukan di Google Drive setelah upload. Data ID: ' . $data->id . ' | Path: ' . $googleUpload);
+                Log::info('JOB : listContents di folder ' . $gdPath . ': ' . json_encode($gdFiles));
             }
         } catch (\Exception $e) {
             DB::rollBack();
