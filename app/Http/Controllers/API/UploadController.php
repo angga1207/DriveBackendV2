@@ -156,7 +156,7 @@ class UploadController extends Controller
                 $data->size = $file->getSize();
                 $data->extension = $file->getClientOriginalExtension();
                 $data->mimes = $file->getMimeType();
-                $data->skip_upload_to_google = false;
+                $data->skip_upload_to_google = true;
 
                 $tempFileName = time() . $key . '.' . $file->getClientOriginalExtension();
                 File::copy($file->getRealPath(), public_path() . '/storage/temp/' . $tempFileName);
@@ -414,6 +414,10 @@ class UploadController extends Controller
                 return $this->errorResponse('Chunk session mismatch (file_size/total_chunks differ). Please re-upload.', 200);
             }
 
+            // prevent scheduler from picking it before chunks are assembled
+            $data->skip_upload_to_google = true;
+            $data->saveQuietly();
+
             // Update chunk_size in case schema migration was missing it earlier
             if (empty($existingSession->chunk_size)) {
                 $existingSession->chunk_size = $chunkSize;
@@ -577,18 +581,10 @@ class UploadController extends Controller
 
         $chunkFile = $request->file('chunk');
 
-        // Resolve session
+        // Resolve session (do NOT depend on data_id; chunk_id must be enough)
         $session = \App\Models\UploadChunkSession::where('user_id', auth()->id())
-            ->where('data_id', $dataId)
             ->where('chunk_id', $chunkId)
             ->first();
-
-        // Fallback: if data_id mismatched, try by chunk_id only
-        if (!$session) {
-            $session = \App\Models\UploadChunkSession::where('user_id', auth()->id())
-                ->where('chunk_id', $chunkId)
-                ->first();
-        }
 
         if (!$session) {
             return $this->errorResponse('Chunk session not found', 200);
@@ -645,25 +641,14 @@ class UploadController extends Controller
         $dataId = (int) $request->input('data_id');
 
         $session = \App\Models\UploadChunkSession::where('user_id', auth()->id())
-            ->where('data_id', $dataId)
             ->where('chunk_id', $chunkId)
             ->first();
-
-        // Fallback: if data_id mismatched, try by chunk_id only
-        if (!$session) {
-            $session = \App\Models\UploadChunkSession::where('user_id', auth()->id())
-                ->where('chunk_id', $chunkId)
-                ->first();
-        }
 
         if (!$session) {
             return $this->errorResponse('Chunk session not found', 200);
         }
 
-        // If session exists but data_id mismatched, trust session->data_id
-        $resolvedDataId = (int) ($session->data_id ?? $dataId);
-
-        $data = Data::where('user_id', auth()->id())->where('id', $resolvedDataId)->first();
+        $data = Data::where('user_id', auth()->id())->where('id', (int) $session->data_id)->first();
         if (!$data) {
             return $this->errorResponse('Data not found', 200);
         }
@@ -788,6 +773,10 @@ class UploadController extends Controller
                     File::delete($partPath);
                 }
             }
+
+            // allow scheduler/job to process now that assembled file exists
+            $data->skip_upload_to_google = false;
+            $data->saveQuietly();
 
             TransferLocalFileToGoogle::dispatch($data);
 
