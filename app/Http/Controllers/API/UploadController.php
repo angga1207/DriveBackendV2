@@ -370,6 +370,7 @@ class UploadController extends Controller
             'chunk_id' => 'required|string',
             'file_name' => 'required|string',
             'file_size' => 'required|integer|min:1',
+            'chunk_size' => 'required|integer|min:1',
             'extension' => 'required|string',
             'mimes' => 'required|string',
             'total_chunks' => 'required|integer|min:1',
@@ -387,6 +388,7 @@ class UploadController extends Controller
         $chunkId = $request->input('chunk_id');
         $fileName = $request->input('file_name');
         $fileSize = (int) $request->input('file_size');
+        $chunkSize = (int) $request->input('chunk_size');
         $extension = strtolower($request->input('extension'));
         $mimes = $request->input('mimes');
         $totalChunks = (int) $request->input('total_chunks');
@@ -394,6 +396,36 @@ class UploadController extends Controller
         $forbiddenExtensions = ['php', 'html', 'js', 'css', 'json', 'xml', 'yml', 'yaml', 'env', 'htaccess', 'htpasswd'];
         if (in_array($extension, $forbiddenExtensions)) {
             return $this->errorResponse('File ekstensi ' . $extension . ' tidak diizinkan', 200);
+        }
+
+        // If session already exists, reuse it (so re-upload missing parts doesn't create new Data placeholder)
+        $existingSession = \App\Models\UploadChunkSession::where('user_id', auth()->id())
+            ->where('chunk_id', $chunkId)
+            ->first();
+
+        if ($existingSession) {
+            $data = Data::where('id', $existingSession->data_id)->where('user_id', auth()->id())->first();
+            if (!$data) {
+                return $this->errorResponse('Chunk session exists but data not found', 200);
+            }
+
+            // Basic consistency checks (if mismatch => fail so client can restart properly)
+            if ((int) $existingSession->file_size !== $fileSize || (int) $existingSession->total_chunks !== $totalChunks) {
+                return $this->errorResponse('Chunk session mismatch (file_size/total_chunks differ). Please re-upload.', 200);
+            }
+
+            // Update chunk_size in case schema migration was missing it earlier
+            if (empty($existingSession->chunk_size)) {
+                $existingSession->chunk_size = $chunkSize;
+                $existingSession->save();
+            }
+
+            return $this->successResponse([
+                'data_id' => $data->id,
+                'chunk_id' => $existingSession->chunk_id,
+                'total_chunks' => $existingSession->total_chunks,
+                'temp_path' => $data->temp_path,
+            ], 'Chunk session reused', 200);
         }
 
         DB::beginTransaction();
@@ -438,7 +470,6 @@ class UploadController extends Controller
 
             // Normalize filename (remove extension for Data->name like existing logic)
             $baseName = pathinfo($fileName, PATHINFO_FILENAME);
-            $fullExt = pathinfo($fileName, PATHINFO_EXTENSION);
             if (!$baseName) {
                 $baseName = $fileName;
             }
@@ -501,6 +532,7 @@ class UploadController extends Controller
             $session->data_id = $data->id;
             $session->chunk_id = $chunkId;
             $session->file_size = $fileSize;
+            $session->chunk_size = $chunkSize;
             $session->total_chunks = $totalChunks;
             $session->uploaded_parts = 0;
             $session->status = 'processing';
@@ -589,7 +621,7 @@ class UploadController extends Controller
     }
 
     /**
-     * Chunk upload - complete (assemble + dispatch job)
+     * Chunk upload - complete (preflight / assemble + dispatch job)
      */
     function uploadChunkComplete(Request $request)
     {
@@ -614,10 +646,6 @@ class UploadController extends Controller
             return $this->errorResponse('Chunk session not found', 200);
         }
 
-        if (!$session->isCompleted()) {
-            return $this->errorResponse('Chunks not completed yet', 200);
-        }
-
         $data = Data::where('user_id', auth()->id())->where('id', $dataId)->first();
         if (!$data) {
             return $this->errorResponse('Data not found', 200);
@@ -630,23 +658,84 @@ class UploadController extends Controller
             return $this->errorResponse('Invalid temp_path for data', 200);
         }
 
-        DB::beginTransaction();
-        try {
-            if (!File::exists($chunkDir)) {
-                return $this->errorResponse('Chunk directory missing', 200);
+        if (!File::exists($chunkDir)) {
+            return $this->successResponse([
+                'data_id' => $data->id,
+                'progress_percentage' => 0,
+                'missing_chunks' => range(0, max(0, $session->total_chunks - 1)),
+            ], 'Chunk parts not found', 200);
+        }
+
+        // Preflight check: missing/invalid parts are deleted and returned as missing_chunks.
+        $missingChunks = [];
+        $validPartsCount = 0;
+
+        // expected size calculation
+        $expectedBaseSize = (int) ($session->chunk_size ?? 0);
+
+        for ($i = 0; $i < $session->total_chunks; $i++) {
+            $partPath = $chunkDir . '/part_' . $i;
+
+            $expectedSize = null;
+            if ($expectedBaseSize > 0) {
+                if ($i < ($session->total_chunks - 1)) {
+                    $expectedSize = $expectedBaseSize;
+                } else {
+                    $expectedSize = (int) $session->file_size - ($expectedBaseSize * ($session->total_chunks - 1));
+                }
             }
 
+            if (!File::exists($partPath)) {
+                $missingChunks[] = $i;
+                continue;
+            }
+
+            $partSize = (int) filesize($partPath);
+
+            $isValid = true;
+            if ($expectedSize !== null) {
+                if ($partSize !== (int) $expectedSize) {
+                    $isValid = false;
+                }
+            }
+
+            if (!$isValid) {
+                // delete invalid partial
+                File::delete($partPath);
+                $missingChunks[] = $i;
+                continue;
+            }
+
+            $validPartsCount++;
+        }
+
+        // Update session status/progress based on valid parts.
+        $session->uploaded_parts = $validPartsCount;
+        $session->status = count($missingChunks) > 0 ? 'processing' : 'completed';
+        $session->save();
+
+        if (count($missingChunks) > 0) {
+            return $this->successResponse([
+                'data_id' => $data->id,
+                'progress_percentage' => $session->getProgressPercentage(),
+                'missing_chunks' => $missingChunks,
+            ], 'Chunk parts missing/invalid', 200);
+        }
+
+        // Assemble in order
+        DB::beginTransaction();
+        try {
             $out = fopen($outputPath, 'wb');
             if (!$out) {
                 return $this->errorResponse('Cannot create output file', 200);
             }
 
-            // Assemble in order
             for ($i = 0; $i < $session->total_chunks; $i++) {
                 $partPath = $chunkDir . '/part_' . $i;
+
                 if (!File::exists($partPath)) {
                     fclose($out);
-                    return $this->errorResponse('Missing chunk part: ' . $i, 200);
+                    return $this->errorResponse('Missing chunk part after preflight: ' . $i, 200);
                 }
 
                 $in = fopen($partPath, 'rb');
@@ -668,20 +757,29 @@ class UploadController extends Controller
             // Basic verification
             $assembledSize = filesize($outputPath);
             if ((int) $assembledSize !== (int) $session->file_size) {
-                // allow small mismatch but mark failed if too off
                 if ($assembledSize <= 0) {
                     return $this->errorResponse('Assembled file invalid', 200);
                 }
             }
 
             $session->update(['status' => 'completed']);
-            // Dispatch async upload
+
+            // delete partials after assemble
+            for ($i = 0; $i < $session->total_chunks; $i++) {
+                $partPath = $chunkDir . '/part_' . $i;
+                if (File::exists($partPath)) {
+                    File::delete($partPath);
+                }
+            }
+
             TransferLocalFileToGoogle::dispatch($data);
 
             DB::commit();
+
             return $this->successResponse([
                 'data_id' => $data->id,
                 'progress_percentage' => 100,
+                'missing_chunks' => [],
             ], 'Chunk upload completed', 200);
         } catch (\Exception $e) {
             DB::rollBack();

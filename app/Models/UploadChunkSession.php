@@ -17,6 +17,7 @@ class UploadChunkSession extends Model
         'data_id',
         'chunk_id',
         'file_size',
+        'chunk_size',
         'total_chunks',
         'uploaded_parts',
         'status',
@@ -24,6 +25,7 @@ class UploadChunkSession extends Model
 
     protected $casts = [
         'file_size' => 'integer',
+        'chunk_size' => 'integer',
         'total_chunks' => 'integer',
         'uploaded_parts' => 'integer',
     ];
