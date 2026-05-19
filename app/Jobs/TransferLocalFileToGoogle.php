@@ -1,0 +1,145 @@
+<?php
+
+namespace App\Jobs;
+
+use Carbon\Carbon;
+use App\Models\Data;
+use Illuminate\Http\File;
+use Illuminate\Bus\Batchable;
+use Illuminate\Bus\Queueable;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Support\Facades\File as FacadesFile;
+
+class TransferLocalFileToGoogle implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels, Batchable;
+
+    public function __construct(private Data $data)
+    {
+        $this->data = $data;
+    }
+
+    public function handle()
+    {
+        if (!$this->data) {
+            Log::warning('JOB : Data tidak ditemukan, job akan dihentikan.');
+            return;
+        }
+
+        $data = $this->data->fresh();
+
+        Log::info('JOB : Memproses Data ID: ' . $data->id . ' | File: ' . $data->name);
+
+        $filePath = $data->temp_path;
+
+        if (!$filePath) {
+            Log::warning('JOB : File tidak ditemukan di lokal, data akan diskip. Path: ' . $filePath . ' | Data ID: ' . $data->id);
+            $data->update(['skip_upload_to_google' => true]);
+            return;
+        }
+
+        if (!file_exists($filePath)) {
+            Log::warning('JOB : File tidak ditemukan di lokal, data akan di force delete. Path: ' . $filePath . ' | Data ID: ' . $data->id);
+            $data->forceDelete();
+            return;
+        }
+
+        DB::beginTransaction();
+        try {
+            $gdFolder = $data->user_id . '/' . Carbon::now()->format('Ymd');
+            $fileName = $this->sanitizeFileName($data->name) . '.' . $data->extension;
+            $gdPath = 'files_2/' . $gdFolder;
+
+            Log::info('JOB : Mengupload ke Google Drive. DataID : ' . $data->id . ' | Folder: ' . $gdPath . ' | File: ' . $fileName . ' | File Size: ' . $data->isoSize($data->size));
+
+            // PDF dan gambar: biarkan Google generate nama file sendiri agar preview tidak error
+            $mimePrefix = strtok($data->mimes ?? '', '/');
+            $useRandomName = in_array($data->extension, ['pdf']) || in_array($mimePrefix, ['image']);
+
+            if ($useRandomName) {
+                $googleUpload = Storage::disk('google')->putFile($gdPath, new File($filePath), 'public');
+            } else {
+                $googleUpload = Storage::disk('google')->putFileAs($gdPath, new File($filePath), $fileName, 'public');
+            }
+
+            $gdFiles = collect(Storage::disk('google')->listContents($gdPath, true));
+            $uploaded = $gdFiles->where('path', $googleUpload)->first();
+
+            if ($uploaded) {
+                $data->path = $uploaded['extraMetadata']['id'];
+                $data->gd_folder = $gdFolder;
+                $data->temp_path = null;
+                $data->upload_batch_id = null;
+                $data->skip_upload_to_google = true;
+                $data->saveQuietly();
+
+                DB::commit();
+                if ($data->path && $data->temp_path && file_exists($data->temp_path)) {
+                    FacadesFile::delete($data->temp_path);
+                }
+                Log::info('JOB : Upload berhasil. Data ID: ' . $data->id . ' | Google Drive ID: ' . $uploaded['extraMetadata']['id'] . ' | Slug: ' . $data->slug . ' | Parent Slug: ' . ($data->parent->slug ?? $data->parent_id));
+            } else {
+                DB::rollBack();
+                Log::error('JOB : Upload gagal, file tidak ditemukan di Google Drive setelah upload. Data ID: ' . $data->id . ' | Path: ' . $googleUpload);
+                Log::info('JOB : listContents di folder ' . $gdPath . ': ' . json_encode($gdFiles));
+            }
+        } catch (\Exception $e) {
+            DB::rollBack();
+
+            $data->update(['skip_upload_to_google' => true]);
+
+            Log::error('JOB : Exception saat upload. Data ID: ' . $data->id . ' | Error: ' . $e->getMessage() . ' | Line: ' . $e->getLine());
+        }
+    }
+
+    private function sanitizeFileName(string $name): string
+    {
+        $replacements = [
+            "'" => '_',
+            '"' => '_',
+            '`' => '_',
+            '-' => '_',
+            ' ' => '_',
+            '&' => 'and',
+            ':' => '',
+            '|' => '',
+            '?' => '',
+            '*' => '',
+            '/' => '',
+            '\\' => '',
+            '<' => '',
+            '>' => '',
+            '^' => '',
+            '%' => '',
+            '$' => '',
+            '#' => '',
+            '@' => '',
+            '!' => '',
+            '+' => '',
+            '=' => '',
+            '{' => '',
+            '}' => '',
+            '[' => '',
+            ']' => '',
+            '(' => '',
+            ')' => '',
+            ';' => '',
+            ',' => '',
+            '~' => '',
+            '.' => '',
+        ];
+
+        $name = str_replace(array_keys($replacements), array_values($replacements), $name);
+        $name = preg_replace('/-{2,}/', '-', $name);
+        $name = preg_replace('/_{2,}/', '_', $name);
+        $name = trim($name, ' -_');
+
+        return $name;
+    }
+}
