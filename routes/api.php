@@ -9,6 +9,7 @@ use App\Http\Controllers\API\UserController;
 use App\Http\Controllers\API\ProfileController;
 use App\Http\Controllers\API\SearchController;
 use App\Http\Controllers\API\UploadController;
+use App\Http\Controllers\API\SecurityLoginController;
 
 /*
 |--------------------------------------------------------------------------
@@ -42,6 +43,17 @@ Route::post('/evalakip/Upload', [UploadController::class, 'postUploadEvalakip'])
 
 // Protected routes (require authentication)
 Route::middleware('auth:sanctum')->group(function () {
+
+    // Security (login brute force protection)
+    Route::post('/v2/security/reset-login-security', [SecurityLoginController::class, 'resetLoginSecurity']);
+
+    // SL Blocks
+    Route::get('/v2/security/get-blocked-login-security', [SecurityLoginController::class, 'getBlockedLoginSecurity']);
+    Route::post('/v2/security/restore-login-security', [SecurityLoginController::class, 'restoreLoginSecurity']);
+
+    // SL Attempts
+    Route::get('/v2/security/get-login-attempts', [SecurityLoginController::class, 'getLoginAttemptsSecurity']);
+    Route::post('/v2/security/restore-login-attempts', [SecurityLoginController::class, 'restoreLoginAttemptsSecurity']);
 
     // Auth & Profile
     Route::post('/logout', [AuthController::class, 'logout']);

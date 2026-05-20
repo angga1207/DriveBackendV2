@@ -10,6 +10,7 @@ use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Validator;
+use App\Services\SecurityLoginService;
 
 class AuthController extends Controller
 {
@@ -130,18 +131,45 @@ class AuthController extends Controller
             ], 'Login success');
         }
 
+        $ipAddress = SecurityLoginService::getClientIp();
+        $userId = SecurityLoginService::resolveUserIdByUsername($request->username);
+
+        if (SecurityLoginService::isBlocked($ipAddress, $userId)) {
+            return $this->errorResponse('Terlalu banyak percobaan login gagal. Akses diblokir sementara.', 200);
+        }
+
         $credentials = $request->only('username', 'password');
-        if (auth()->attempt($credentials)) {
-            $user = auth()->user();
-            $token = $user->createToken('authToken')->plainTextToken;
+        try {
+            if (auth()->attempt($credentials)) {
+                $user = auth()->user();
+                $token = $user->createToken('authToken')->plainTextToken;
 
-            $this->_logActivity('Login ke aplikasi', 'login');
+                $this->_logActivity('Login ke aplikasi', 'login');
 
-            return $this->successResponse([
-                'user' => $this->_UserGenerate($user),
-                'token' => $token
-            ], 'Login success');
-        } else {
+                return $this->successResponse([
+                    'user' => $this->_UserGenerate($user),
+                    'token' => $token
+                ], 'Login success');
+            }
+
+            SecurityLoginService::recordFailedAttempt($ipAddress, $userId, $request->username);
+            $blockResult = SecurityLoginService::evaluateAndBlockIfNeeded($ipAddress, $userId);
+
+            if (($blockResult['blocked'] ?? false) === true) {
+                return $this->errorResponse('Terlalu banyak percobaan login gagal. Akses diblokir sementara.', 200);
+            }
+
+            return $this->errorResponse('Username atau password salah', 200);
+        } catch (\Throwable $e) {
+            // Some stored passwords might not be bcrypt (historical data). Treat it as a failed attempt
+            // instead of returning 500 and skipping security logging.
+            SecurityLoginService::recordFailedAttempt($ipAddress, $userId, $request->username);
+            $blockResult = SecurityLoginService::evaluateAndBlockIfNeeded($ipAddress, $userId);
+
+            if (($blockResult['blocked'] ?? false) === true) {
+                return $this->errorResponse('Terlalu banyak percobaan login gagal. Akses diblokir sementara.', 200);
+            }
+
             return $this->errorResponse('Username atau password salah', 200);
         }
     }
@@ -391,19 +419,48 @@ class AuthController extends Controller
                     ], 'Login success');
                 }
 
-                $credentials = $request->only('username', 'password');
-                if (auth()->attempt($credentials)) {
-                    $user = auth()->user();
-                    $token = $user->createToken('authToken')->plainTextToken;
+                $ipAddress = SecurityLoginService::getClientIp();
+                $userId = SecurityLoginService::resolveUserIdByUsername($request->username);
 
-                    $this->_logActivity('Login ke aplikasi', 'mobile-login', 'mobile');
+                if (SecurityLoginService::isBlocked($ipAddress, $userId)) {
+                    return $this->errorResponse('Terlalu banyak percobaan login gagal. Akses diblokir sementara.', 200);
+                }
+
+                $credentials = $request->only('username', 'password');
+                try {
+                    if (auth()->attempt($credentials)) {
+                        $user = auth()->user();
+                        $token = $user->createToken('authToken')->plainTextToken;
+
+                        $this->_logActivity('Login ke aplikasi', 'mobile-login', 'mobile');
+
+                        DB::commit();
+                        return $this->successResponse([
+                            'user' => $this->_UserGenerate($user),
+                            'token' => $token
+                        ], 'Login success');
+                    }
+
+                    SecurityLoginService::recordFailedAttempt($ipAddress, $userId, $request->username);
+                    $blockResult = SecurityLoginService::evaluateAndBlockIfNeeded($ipAddress, $userId);
+
+                    if (($blockResult['blocked'] ?? false) === true) {
+                        DB::commit();
+                        return $this->errorResponse('Terlalu banyak percobaan login gagal. Akses diblokir sementara.', 200);
+                    }
 
                     DB::commit();
-                    return $this->successResponse([
-                        'user' => $this->_UserGenerate($user),
-                        'token' => $token
-                    ], 'Login success');
-                } else {
+                    return $this->errorResponse('Password yang anda masukkan salah', 200);
+                } catch (\Throwable $e) {
+                    SecurityLoginService::recordFailedAttempt($ipAddress, $userId, $request->username);
+                    $blockResult = SecurityLoginService::evaluateAndBlockIfNeeded($ipAddress, $userId);
+
+                    if (($blockResult['blocked'] ?? false) === true) {
+                        DB::commit();
+                        return $this->errorResponse('Terlalu banyak percobaan login gagal. Akses diblokir sementara.', 200);
+                    }
+
+                    DB::commit();
                     return $this->errorResponse('Password yang anda masukkan salah', 200);
                 }
             }
