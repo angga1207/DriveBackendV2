@@ -132,12 +132,12 @@ class ProfileController extends Controller
         }
     }
 
-    function getActivities(Request $request)
+    public function getActivities(Request $request)
     {
         try {
-            $datas = Activity::where('causer_id', auth()->user()->id)
+            $datas = Activity::query()
+                ->where('causer_id', auth()->id())
                 ->orderBy('created_at', 'desc')
-                ->whereDate('created_at', '>=', now()->subDays(30))
                 ->paginate(10);
 
             $return = [

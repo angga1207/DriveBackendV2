@@ -10,6 +10,7 @@ use App\Http\Controllers\API\ProfileController;
 use App\Http\Controllers\API\SearchController;
 use App\Http\Controllers\API\UploadController;
 use App\Http\Controllers\API\SecurityLoginController;
+use App\Http\Controllers\API\AdminInsightsController;
 
 /*
 |--------------------------------------------------------------------------
@@ -123,4 +124,8 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::post('/updateUser/{id}', [UserController::class, 'updateUser']);
     Route::post('/updateUserAccess/{id}', [UserController::class, 'updateUserAccess']);
     Route::delete('/deleteUser/{id}', [UserController::class, 'deleteUser']);
+
+    // Administrative reporting (restricted again inside the controller to user IDs 1 and 4)
+    Route::get('/v2/admin/analytics', [AdminInsightsController::class, 'analytics']);
+    Route::get('/v2/admin/activities', [AdminInsightsController::class, 'activities']);
 });
