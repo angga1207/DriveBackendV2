@@ -46,18 +46,19 @@ class AuthController extends Controller
         return $data;
     }
 
-    private function _logActivity($message, $event, $type = 'web', $performedOn = null)
+    private function _logActivity($message, $event, $type = 'web', $performedOn = null, $causer = null)
     {
         $log = activity();
         if ($performedOn) {
             $log->performedOn($performedOn);
         }
-        if (auth()->check()) {
-            $log->causedBy(auth()->user());
+        $activityCauser = $causer ?? auth()->user();
+        if ($activityCauser) {
+            $log->causedBy($activityCauser);
         }
         $log->withProperties([
             'ip' => request()->ip(),
-            'agent' => request()->header('user-agent'),
+            'agent' => request()->header('x-forwarded-user-agent') ?: request()->userAgent(),
             'locale' => request()->header('accept-language'),
             'device' => request()->header('user-device'),
             'browser' => request()->header('user-browser'),
@@ -68,8 +69,8 @@ class AuthController extends Controller
             'referer' => request()->header('referer'),
             'method' => request()->method(),
             'url' => request()->fullUrl(),
-            'user' => request()->userAgent(),
-            'user_id' => auth()->id(),
+            'user' => request()->header('x-forwarded-user-agent') ?: request()->userAgent(),
+            'user_id' => $activityCauser?->getKey(),
             'type' => $type,
             'event' => $event,
         ])->log($message);
@@ -144,7 +145,7 @@ class AuthController extends Controller
                 $user = auth()->user();
                 $token = $user->createToken('authToken')->plainTextToken;
 
-                $this->_logActivity('Login ke aplikasi', 'login');
+                $this->_logActivity('Login ke aplikasi', 'login', 'web', null, $user);
 
                 return $this->successResponse([
                     'user' => $this->_UserGenerate($user),
@@ -229,7 +230,7 @@ class AuthController extends Controller
 
                 $token = $user->createToken('authToken')->plainTextToken;
 
-                $this->_logActivity('Login ke aplikasi menggunakan Auto Login', 'auto-login');
+                $this->_logActivity('Login ke aplikasi menggunakan Auto Login', 'auto-login', 'web', null, $user);
 
                 DB::commit();
                 return $this->successResponse([
@@ -312,7 +313,7 @@ class AuthController extends Controller
 
                 $token = $user->createToken('authToken')->plainTextToken;
 
-                $this->_logActivity('Login ke aplikasi menggunakan Semesta', 'login-semesta');
+                $this->_logActivity('Login ke aplikasi menggunakan Semesta', 'login-semesta', 'web', null, $user);
 
                 DB::commit();
                 return $this->successResponse([
@@ -383,7 +384,7 @@ class AuthController extends Controller
 
                 $token = $user->createToken('authToken')->plainTextToken;
 
-                $this->_logActivity('Login ke aplikasi menggunakan Semesta', 'mobile-login-semesta', 'mobile');
+                $this->_logActivity('Login ke aplikasi menggunakan Semesta', 'mobile-login-semesta', 'mobile', null, $user);
 
                 DB::commit();
                 return $this->successResponse([
@@ -432,7 +433,7 @@ class AuthController extends Controller
                         $user = auth()->user();
                         $token = $user->createToken('authToken')->plainTextToken;
 
-                        $this->_logActivity('Login ke aplikasi', 'mobile-login', 'mobile');
+                        $this->_logActivity('Login ke aplikasi', 'mobile-login', 'mobile', null, $user);
 
                         DB::commit();
                         return $this->successResponse([
@@ -519,7 +520,7 @@ class AuthController extends Controller
 
             $token = $user->createToken('authToken')->plainTextToken;
 
-            $this->_logActivity('Login ke aplikasi melalui Google', 'login-google');
+            $this->_logActivity('Login ke aplikasi melalui Google', 'login-google', 'web', null, $user);
 
             DB::commit();
             return $this->successResponse([
@@ -577,7 +578,7 @@ class AuthController extends Controller
 
             $token = $user->createToken('authToken')->plainTextToken;
 
-            $this->_logActivity('Login ke aplikasi melalui Apple ID', 'login-apple');
+            $this->_logActivity('Login ke aplikasi melalui Apple ID', 'login-apple', 'web', null, $user);
 
             DB::commit();
             return $this->successResponse([

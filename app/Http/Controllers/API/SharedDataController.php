@@ -25,7 +25,7 @@ class SharedDataController extends Controller
         $log->causedBy(auth()->user())
             ->withProperties([
                 'ip' => request()->ip(),
-                'agent' => request()->header('user-agent'),
+                'agent' => request()->header('x-forwarded-user-agent') ?: request()->userAgent(),
                 'locale' => request()->header('accept-language'),
                 'device' => request()->header('user-device'),
                 'browser' => request()->header('user-browser'),
