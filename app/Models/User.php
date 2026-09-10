@@ -48,6 +48,11 @@ class User extends Authenticatable
         'email_verified_at' => 'datetime',
     ];
 
+    public function hasAdminAccess(): bool
+    {
+        return in_array($this->isAdmin, [true, 'true', 1, '1'], true);
+    }
+
     public function OPD()
     {
         return $this->hasOne(RefPerangkatDaerah::class, 'id', 'perangkat_daerah_id');

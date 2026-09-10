@@ -56,6 +56,11 @@ Route::middleware('auth:sanctum')->group(function () {
     Route::get('/v2/security/get-login-attempts', [SecurityLoginController::class, 'getLoginAttemptsSecurity']);
     Route::post('/v2/security/restore-login-attempts', [SecurityLoginController::class, 'restoreLoginAttemptsSecurity']);
 
+    Route::get('/profile/sessions/current', [\App\Http\Controllers\API\SessionController::class, 'current']);
+    Route::get('/profile/sessions', [\App\Http\Controllers\API\SessionController::class, 'index']);
+    Route::delete('/profile/sessions/others', [\App\Http\Controllers\API\SessionController::class, 'destroyOthers']);
+    Route::delete('/profile/sessions/{id}', [\App\Http\Controllers\API\SessionController::class, 'destroy'])->whereNumber('id');
+
     // Auth & Profile
     Route::post('/logout', [AuthController::class, 'logout']);
     Route::get('/getProfile', [ProfileController::class, 'getProfile']);
@@ -117,15 +122,17 @@ Route::middleware('auth:sanctum')->group(function () {
     // Search
     Route::get('/search', [SearchController::class, 'search']);
 
-    // User Management
-    Route::get('/getUsers', [UserController::class, 'getUsers']);
-    Route::get('/v2/getUsers', [UserController::class, 'getUsersV2']);
-    Route::post('/createUser', [UserController::class, 'createUser']);
-    Route::post('/updateUser/{id}', [UserController::class, 'updateUser']);
-    Route::post('/updateUserAccess/{id}', [UserController::class, 'updateUserAccess']);
-    Route::delete('/deleteUser/{id}', [UserController::class, 'deleteUser']);
+    Route::post('/v2/admin/users/actions', [\App\Http\Controllers\API\UserLifecycleController::class, 'bulk'])->middleware(\App\Http\Middleware\AdminMiddleware::class);
 
-    // Administrative reporting (restricted again inside the controller to user IDs 1 and 4)
+    // User Management
+    Route::get('/getUsers', [UserController::class, 'getUsers'])->middleware(\App\Http\Middleware\AdminMiddleware::class);
+    Route::get('/v2/getUsers', [UserController::class, 'getUsersV2'])->middleware(\App\Http\Middleware\AdminMiddleware::class);
+    Route::post('/createUser', [UserController::class, 'createUser'])->middleware(\App\Http\Middleware\AdminMiddleware::class);
+    Route::post('/updateUser/{id}', [UserController::class, 'updateUser'])->middleware(\App\Http\Middleware\AdminMiddleware::class);
+    Route::post('/updateUserAccess/{id}', [UserController::class, 'updateUserAccess'])->middleware(\App\Http\Middleware\AdminMiddleware::class);
+    Route::delete('/deleteUser/{id}', [UserController::class, 'deleteUser'])->middleware(\App\Http\Middleware\AdminMiddleware::class);
+
+    // Administrative reporting (database admin permission)
     Route::get('/v2/admin/analytics', [AdminInsightsController::class, 'analytics']);
     Route::get('/v2/admin/activities', [AdminInsightsController::class, 'activities']);
 });

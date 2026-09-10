@@ -10,7 +10,7 @@ class AdminMiddleware
 {
     public function handle(Request $request, Closure $next): Response
     {
-        if (!auth()->check() || auth()->user()->isAdmin !== 'true') {
+        if (!auth()->user()?->hasAdminAccess()) {
             return response()->json([
                 'status' => 'unauthorized',
                 'message' => 'Anda tidak memiliki akses admin.',

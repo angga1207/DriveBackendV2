@@ -17,8 +17,7 @@ class SecurityLoginController extends Controller
 
     private function _authorizeAdmin(): bool
     {
-        $adminId = auth()->id();
-        return $adminId && ($adminId === 1 || $adminId === 4);
+        return auth()->user()?->hasAdminAccess() ?? false;
     }
 
     /**

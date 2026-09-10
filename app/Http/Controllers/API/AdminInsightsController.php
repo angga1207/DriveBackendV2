@@ -16,7 +16,7 @@ class AdminInsightsController extends Controller
 
     private function authorizeAdmin()
     {
-        if (!in_array((int) auth()->id(), [1, 4], true)) {
+        if (!auth()->user()?->hasAdminAccess()) {
             return $this->unauthorizedResponse('Akses ditolak', 403);
         }
 

@@ -35,4 +35,7 @@ return [
         ],
     ],
 
+    'semesta' => [
+        'auto_login_password' => env('SEMESTA_AUTO_LOGIN_PASSWORD', '#OganIlirBangkit!!'),
+    ],
 ];

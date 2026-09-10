@@ -135,8 +135,12 @@ class ProfileController extends Controller
     public function getActivities(Request $request)
     {
         try {
+            $event = $request->string('event')->trim()->value();
+
             $datas = Activity::query()
                 ->where('causer_id', auth()->id())
+                // Jenis aktivitas aplikasi disimpan di properties->event, bukan kolom event bawaan Spatie.
+                ->when($event !== '', fn ($query) => $query->where('properties->event', $event))
                 ->orderBy('created_at', 'desc')
                 ->paginate(10);
 
@@ -145,11 +149,36 @@ class ProfileController extends Controller
                 'current_page' => $datas->currentPage(),
                 'last_page' => $datas->lastPage(),
                 'total' => $datas->total(),
+                // Daftar penuh jenis aktivitas, bukan hanya yang tampil di halaman ini.
+                'events' => $this->availableActivityEvents(),
             ];
             return $this->successResponse($return, 'Activities', 200);
         } catch (\Exception $e) {
             return $this->errorResponse($e->getMessage(), 200);
         }
+    }
+
+    /**
+     * Daftar unik jenis aktivitas milik pengguna, diambil dari properties->event.
+     * Tiap driver punya cara sendiri membaca JSON: Postgres pakai ->>,
+     * SQLite mengembalikan skalar tanpa kutip, MySQL perlu json_unquote.
+     */
+    private function availableActivityEvents(): \Illuminate\Support\Collection
+    {
+        $extract = match (DB::connection()->getDriverName()) {
+            'pgsql' => "properties->>'event'",
+            'sqlite' => "json_extract(properties, '$.event')",
+            default => "json_unquote(json_extract(properties, '$.event'))",
+        };
+
+        return Activity::query()
+            ->where('causer_id', auth()->id())
+            ->selectRaw("{$extract} as event_name")
+            ->distinct()
+            ->orderBy('event_name')
+            ->pluck('event_name')
+            ->filter(fn ($value) => is_string($value) && $value !== '')
+            ->values();
     }
 
     function deleteMySelf(Request $request)

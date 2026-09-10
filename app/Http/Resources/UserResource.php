@@ -40,8 +40,10 @@ class UserResource extends JsonResource
                 'folders' => $folderCount,
                 'shared' => $sharedCount,
             ],
+            'isAdmin' => $this->hasAdminAccess(),
             'access' => $this->access == 'true' ? true : false,
             'created_at' => $this->created_at,
+            'deleted_at' => $this->deleted_at,
             'updated_at' => $this->updated_at,
         ];
 

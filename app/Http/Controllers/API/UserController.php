@@ -2,22 +2,21 @@
 
 namespace App\Http\Controllers\API;
 
-use App\Models\User;
-use App\Models\Data;
-use App\Traits\JsonReturner;
-use Illuminate\Http\Request;
-use Illuminate\Support\Facades\DB;
 use App\Http\Controllers\Controller;
 use App\Http\Resources\UserResource;
-use Illuminate\Support\Facades\Validator;
+use App\Models\Data;
+use App\Models\User;
 use App\Notifications\FirebaseNotification;
+use App\Traits\JsonReturner;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Notification;
+use Illuminate\Support\Facades\Validator;
 
 class UserController extends Controller
 {
     use JsonReturner;
 
-    function getUsers(Request $request)
+    public function getUsers(Request $request)
     {
         try {
             $users = User::search($request->search)
@@ -33,11 +32,22 @@ class UserController extends Controller
         }
     }
 
-    function getUsersV2(Request $request)
+    public function getUsersV2(Request $request)
     {
+        $request->validate([
+            'state' => 'nullable|in:active,deleted',
+            'access' => 'nullable|in:all,true,false',
+            'integration' => 'nullable|in:all,google,semesta,both,none',
+            'per_page' => 'nullable|integer|min:1|max:100',
+            'page' => 'nullable|integer|min:1',
+            'search' => 'nullable|string|max:255',
+            'order_by' => 'nullable|in:id,fullname,drive_usage,created_at,deleted_at',
+            'order_direction' => 'nullable|in:asc,desc',
+        ]);
+        $deleted = $request->input('state') === 'deleted';
         try {
             // Batch all stat counts into a single query
-            $statsQuery = User::query()
+            $statsQuery = User::query()->where('status', 'active')
                 ->selectRaw("
                     COUNT(CASE WHEN perangkat_daerah_id IS NOT NULL THEN 1 END) as semesta_count,
                     COUNT(CASE WHEN google_id IS NOT NULL THEN 1 END) as google_count,
@@ -48,15 +58,28 @@ class UserController extends Controller
                 ")
                 ->first();
 
-            $users = User::search($request->search)
-                ->where('status', 'active')
+            $users = User::query()
+                ->when($request->filled('search'), function ($query) use ($request) {
+                    $query->where(function ($query) use ($request) {
+                        foreach (['fullname', 'firstname', 'lastname', 'username', 'email'] as $column) {
+                            $query->orWhereLike($column, '%'.$request->input('search').'%');
+                        }
+                    });
+                })
+                ->when(in_array($request->input('access'), ['true', 'false'], true), fn ($query) => $query->where('access', $request->input('access')))
+                ->when($request->input('integration') === 'google', fn ($query) => $query->whereNotNull('google_id'))
+                ->when($request->input('integration') === 'semesta', fn ($query) => $query->whereNotNull('perangkat_daerah_id'))
+                ->when($request->input('integration') === 'both', fn ($query) => $query->whereNotNull('google_id')->whereNotNull('perangkat_daerah_id'))
+                ->when($request->input('integration') === 'none', fn ($query) => $query->whereNull('google_id')->whereNull('perangkat_daerah_id'))
+                ->when($deleted, fn ($query) => $query->onlyTrashed())
+                ->when(! $deleted, fn ($query) => $query->where('status', 'active'))
                 ->whereIn('access', ['true', 'false'])
                 // Eager load aggregates to avoid N+1 queries in UserResource
                 ->addSelect(['drive_size_sum' => Data::selectRaw('COALESCE(SUM(size), 0)')
                     ->whereColumn('user_id', 'users.id')
                     ->where('type', 'file')
                     ->whereNull('temp_path')
-                    ->whereNull('deleted_at')
+                    ->whereNull('deleted_at'),
                 ])
                 ->withCount([
                     'MyDrive as files_count' => function ($q) {
@@ -80,7 +103,7 @@ class UserController extends Controller
                         $query->orderBy($request->order_by, $request->order_direction ?? 'desc');
                     }
                 })
-                ->orderBy('access', 'desc')
+                ->orderBy('access', 'desc')->orderBy('id', 'desc')
                 ->paginate($request->per_page ?? 10);
 
             return $this->successResponse([
@@ -89,6 +112,8 @@ class UserController extends Controller
                 'last_page' => $users->lastPage(),
                 'per_page' => $users->perPage(),
                 'total' => $users->total(),
+                'deleted_users_count' => User::onlyTrashed()->count(),
+                'active_users_count' => User::where('status', 'active')->count(),
 
                 'accessed_users_count' => $statsQuery->accessed_count ?? 0,
                 'unaccessed_users_count' => $statsQuery->unaccessed_count ?? 0,
@@ -102,7 +127,7 @@ class UserController extends Controller
         }
     }
 
-    function createUser(Request $request)
+    public function createUser(Request $request)
     {
         $validate = Validator::make($request->all(), [
             'firstname' => 'required|string',
@@ -129,10 +154,10 @@ class UserController extends Controller
         }
 
         try {
-            $user = new User();
+            $user = new User;
             $user->firstname = $request->firstname;
             $user->lastname = $request->lastname;
-            $user->fullname = $request->firstname . ' ' . $request->lastname;
+            $user->fullname = $request->firstname.' '.$request->lastname;
             $user->email = $request->email;
             $user->username = $request->username;
             $user->password = bcrypt($request->password);
@@ -147,9 +172,9 @@ class UserController extends Controller
 
             if ($request->photo) {
                 $photo = $request->photo;
-                $photoName = $user->username . '.' . $photo->getClientOriginalExtension();
+                $photoName = $user->username.'.'.$photo->getClientOriginalExtension();
                 $photo->move(public_path('storage/images'), $photoName);
-                $user->photo = 'storage/images/' . $photoName;
+                $user->photo = 'storage/images/'.$photoName;
             }
 
             $user->save();
@@ -160,13 +185,13 @@ class UserController extends Controller
         }
     }
 
-    function updateUser($id, Request $request)
+    public function updateUser($id, Request $request)
     {
         $validate = Validator::make($request->all(), [
             'id' => 'required|exists:users,id',
             'firstname' => 'required|string',
             'lastname' => 'required|string',
-            'email' => 'required|unique:users,email,' . $id,
+            'email' => 'required|unique:users,email,'.$id,
             'photo' => 'nullable|image|mimes:jpeg,png,jpg,gif,svg|max:5000',
             'capacity' => 'required|numeric',
             'password' => 'nullable|confirmed|string',
@@ -189,7 +214,7 @@ class UserController extends Controller
             $user = User::find($id);
             $user->firstname = $request->firstname;
             $user->lastname = $request->lastname;
-            $user->fullname = $request->firstname . ' ' . $request->lastname;
+            $user->fullname = $request->firstname.' '.$request->lastname;
             $user->email = $request->email;
 
             if ($request->capacity) {
@@ -200,9 +225,9 @@ class UserController extends Controller
 
             if ($request->photo) {
                 $photo = $request->photo;
-                $photoName = $user->username . '.' . $photo->getClientOriginalExtension();
+                $photoName = $user->username.'.'.$photo->getClientOriginalExtension();
                 $photo->move(public_path('storage/images'), $photoName);
-                $user->photo = 'storage/images/' . $photoName;
+                $user->photo = 'storage/images/'.$photoName;
             }
 
             if ($request->password) {
@@ -216,8 +241,11 @@ class UserController extends Controller
         }
     }
 
-    function updateUserAccess($id, Request $request)
+    public function updateUserAccess($id, Request $request)
     {
+        if ((int) $id === (int) $request->user()->id && ! $request->boolean('access')) {
+            return $this->errorResponse('Akses akun yang sedang Anda gunakan tidak dapat dicabut.', 422);
+        }
         $validate = Validator::make($request->all(), [
             'access' => 'required|boolean',
         ], [], [
@@ -230,7 +258,7 @@ class UserController extends Controller
 
         try {
             $user = User::find($id);
-            if (!$user) {
+            if (! $user) {
                 return $this->errorResponse('User not found', 200);
             }
             $user->access = $request->access ? 'true' : 'false';
@@ -258,21 +286,10 @@ class UserController extends Controller
         }
     }
 
-    function deleteUser($id, Request $request)
+    public function deleteUser($id, Request $request)
     {
-        DB::beginTransaction();
-        try {
-            $user = User::find($id);
-            if (!$user) {
-                return $this->errorResponse('User not found', 200);
-            }
-            $user->delete();
+        $request->merge(['action' => 'delete', 'ids' => [(int) $id]]);
 
-            DB::commit();
-            return $this->successResponse(null, 'Pengguna Berhasil Dihapus', 200);
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return $this->errorResponse($e->getMessage(), 200);
-        }
+        return app(UserLifecycleController::class)->bulk($request);
     }
 }

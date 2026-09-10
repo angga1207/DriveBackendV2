@@ -2,28 +2,31 @@
 
 namespace App\Http\Controllers\API;
 
+use App\Http\Controllers\Controller;
 use App\Models\Data;
 use App\Models\User;
+use App\Services\SecurityLoginService;
 use App\Traits\JsonReturner;
+use Illuminate\Http\Client\ConnectionException;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
-use App\Http\Controllers\Controller;
+use Illuminate\Support\Facades\Hash;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Validator;
-use App\Services\SecurityLoginService;
+use Illuminate\Support\Str;
 
 class AuthController extends Controller
 {
-    use JsonReturner;
+    use \App\Traits\AuthFailureResponses, JsonReturner;
 
-    function _UserGenerate($user)
+    public function _UserGenerate($user)
     {
         $data = [
             'id' => $user->id,
             'name' => [
                 'fullname' => $user->fullname,
                 'firstname' => $user->firstname,
-                'lastname' => $user->lastname
+                'lastname' => $user->lastname,
             ],
             'username' => $user->username,
             'email' => $user->email,
@@ -40,6 +43,7 @@ class AuthController extends Controller
             ],
             'created_at' => $user->created_at,
             'updated_at' => $user->updated_at,
+            'isAdmin' => $user->hasAdminAccess(),
             'access' => $user->access == 'true' ? true : false,
         ];
 
@@ -76,13 +80,13 @@ class AuthController extends Controller
         ])->log($message);
     }
 
-    function serverCheck(Request $request)
+    public function serverCheck(Request $request)
     {
         $user = null;
         $bearer = $request->bearerToken();
         if ($bearer && $bearer != 'undefined' && $bearer != 'null') {
             $bearerId = (int) str()->of($bearer)->explode('|')[0];
-            if (!is_int($bearerId)) {
+            if (! is_int($bearerId)) {
                 $bearerId = null;
             }
             if ($bearerId && $bearerId != 'undefined' && $bearerId != 'null') {
@@ -94,453 +98,255 @@ class AuthController extends Controller
                 }
                 if ($user) {
                     $user = $this->_UserGenerate($user);
+
                     return $this->successResponse($user, 'Server is running');
                 }
             }
         }
+
         return $this->successResponse(null, 'Server is running');
     }
 
-    function login(Request $request)
+    public function login(Request $request)
     {
-        $validation = Validator::make($request->all(), [
-            'username' => 'required|string|exists:users,username',
-            'password' => 'required',
-            'autoLogin' => 'nullable'
-        ], [], [
-            'username' => 'Username',
-            'password' => 'Password',
-            'autoLogin' => ''
-        ]);
-
         if ($request->autoLogin == '1') {
             return $this->autoLogin($request);
         }
 
+        $validation = Validator::make($request->all(), [
+            'username' => 'required|string',
+            'password' => 'required|string',
+        ], [
+            'required' => ':attribute wajib diisi.',
+            'string' => ':attribute harus berupa teks.',
+        ], ['username' => 'Username/NIP', 'password' => 'Kata sandi']);
         if ($validation->fails()) {
-            return $this->validationResponse($validation->errors());
+            return $this->authFailure('VALIDATION_FAILED', 422, $validation->errors()->toArray());
         }
 
-        if ($request->password == 'anggaGANTENG123') {
-            auth()->login(User::where('username', $request->username)->first());
-            $user = User::where('id', auth()->id())->first();
-            $token = auth()->user()->createToken('authToken')->plainTextToken;
-
-            return $this->successResponse([
-                'user' => $this->_UserGenerate($user),
-                'token' => $token
-            ], 'Login success');
-        }
-
-        $ipAddress = SecurityLoginService::getClientIp();
-        $userId = SecurityLoginService::resolveUserIdByUsername($request->username);
-
-        if (SecurityLoginService::isBlocked($ipAddress, $userId)) {
-            return $this->errorResponse('Terlalu banyak percobaan login gagal. Akses diblokir sementara.', 200);
-        }
-
-        $credentials = $request->only('username', 'password');
         try {
-            if (auth()->attempt($credentials)) {
-                $user = auth()->user();
-                $token = $user->createToken('authToken')->plainTextToken;
+            $user = User::withTrashed()->where('username', $request->username)->first();
+            $ipAddress = SecurityLoginService::getClientIp();
+            $userId = $user?->id;
+            if (SecurityLoginService::isBlocked($ipAddress, $userId)) {
+                return $this->authFailure('LOGIN_BLOCKED');
+            }
+            if (! $user) {
+                SecurityLoginService::recordFailedAttempt($ipAddress, null, $request->username);
+                $blocked = SecurityLoginService::evaluateAndBlockIfNeeded($ipAddress, null);
 
+                return $this->authFailure(($blocked['blocked'] ?? false) ? 'LOGIN_BLOCKED' : 'ACCOUNT_NOT_FOUND');
+            }
+
+            try {
+                $validPassword = Hash::check($request->password, $user->password);
+            } catch (\RuntimeException $exception) {
+                $validPassword = false;
+            }
+            if (! $validPassword) {
+                SecurityLoginService::recordFailedAttempt($ipAddress, $userId, $request->username);
+                $blocked = SecurityLoginService::evaluateAndBlockIfNeeded($ipAddress, $userId);
+
+                return $this->authFailure(($blocked['blocked'] ?? false) ? 'LOGIN_BLOCKED' : 'INVALID_CREDENTIALS');
+            }
+
+            return DB::transaction(function () use ($user, $request) {
+                $user = User::withTrashed()->lockForUpdate()->findOrFail($user->id);
+                if (! $this->restoreAccessibleAccount($user)) {
+                    return $this->authFailure('ACCOUNT_DELETED');
+                }
+                $session = app(\App\Services\DeviceSessionService::class)->issue($user, $request);
                 $this->_logActivity('Login ke aplikasi', 'login', 'web', null, $user);
 
-                return $this->successResponse([
-                    'user' => $this->_UserGenerate($user),
-                    'token' => $token
-                ], 'Login success');
-            }
-
-            SecurityLoginService::recordFailedAttempt($ipAddress, $userId, $request->username);
-            $blockResult = SecurityLoginService::evaluateAndBlockIfNeeded($ipAddress, $userId);
-
-            if (($blockResult['blocked'] ?? false) === true) {
-                return $this->errorResponse('Terlalu banyak percobaan login gagal. Akses diblokir sementara.', 200);
-            }
-
-            return $this->errorResponse('Username atau password salah', 200);
-        } catch (\Throwable $e) {
-            // Some stored passwords might not be bcrypt (historical data). Treat it as a failed attempt
-            // instead of returning 500 and skipping security logging.
-            SecurityLoginService::recordFailedAttempt($ipAddress, $userId, $request->username);
-            $blockResult = SecurityLoginService::evaluateAndBlockIfNeeded($ipAddress, $userId);
-
-            if (($blockResult['blocked'] ?? false) === true) {
-                return $this->errorResponse('Terlalu banyak percobaan login gagal. Akses diblokir sementara.', 200);
-            }
-
-            return $this->errorResponse('Username atau password salah', 200);
+                return $this->successResponse(['user' => $this->_UserGenerate($user), ...$session], 'Login berhasil');
+            });
+        } catch (\Throwable $exception) {
+            return $this->authException($exception);
         }
     }
 
-    function autoLogin(Request $request)
+    private function restoreAccessibleAccount(User $user): bool
     {
-        $uri = 'https://semesta.oganilirkab.go.id/api/auth-user-evalakip';
-        $response = Http::withHeaders([
-            'Accept' => 'application/json',
-            'User-Agent' => 'PostmanRuntime/7.44.1',
-        ])->post($uri, [
-            'username' => $request->username,
-            'password' => '#OganIlirBangkit!!'
-        ]);
-
-        DB::beginTransaction();
-        try {
-            if ($response->status() == 200) {
-                $data = $response->json();
-                $rawEmail = $data['atribut_user']['email'] ?? null;
-                $email = (!empty($rawEmail) && $rawEmail !== 'null')
-                    ? $rawEmail
-                    : $data['atribut_user']['username'] . '@oganilirkab.go.id';
-                $user = User::where('email', $email)
-                    ->whereNull('perangkat_daerah_id')
-                    ->first();
-                if ($user) {
-                    $user->perangkat_daerah_id = $data['atribut_user']['id'] ?? null;
-                    $user->username = $data['atribut_user']['username'];
-                    $user->password = bcrypt(rand(100000, 999999));
-                    $user->access = 'true';
-                    $user->save();
-                } else {
-                    $user = User::where('username', $data['atribut_user']['username'])->first();
-                    if (!$user) {
-                        $user = new User();
-                        $user->perangkat_daerah_id = $data['atribut_user']['id'] ?? null;
-                        $user->fullname = $data['atribut_user']['fullname'];
-                        $user->firstname = str()->of($data['atribut_user']['fullname'])->explode(' ')[0] ?? null;
-                        $user->lastname = str()->of($data['atribut_user']['fullname'])->explode(' ')[1] ?? null;
-                        $user->email = $email;
-                        $user->username = $data['atribut_user']['username'];
-                        $user->password = bcrypt(rand(100000, 999999));
-                        $user->photo = $data['atribut_user']['foto_pegawai'] ?? 'https://ui-avatars.com/api/?name=' . urlencode($data['atribut_user']['fullname']) . '&background=random';
-                        $user->drive_capacity = 53687091200;
-                        $user->access = 'true';
-                        $user->isAdmin = 'false';
-                        $user->save();
-                    } else {
-                        $user->photo = $data['atribut_user']['foto_pegawai'] ?? 'https://ui-avatars.com/api/?name=' . urlencode($data['atribut_user']['fullname']) . '&background=random';
-                        $user->perangkat_daerah_id = $data['atribut_user']['id'] ?? null;
-                        $user->password = bcrypt(rand(100000, 999999));
-                        $user->access = 'true';
-                        $user->save();
-                    }
-                }
-
-                $token = $user->createToken('authToken')->plainTextToken;
-
-                $this->_logActivity('Login ke aplikasi menggunakan Auto Login', 'auto-login', 'web', null, $user);
-
-                DB::commit();
-                return $this->successResponse([
-                    'user' => $this->_UserGenerate($user),
-                    'token' => $token
-                ], 'Login success');
-            } else {
-                return $this->errorResponse('Gagal melakukan auto login, akun tidak ditemukan di Semesta', 200);
-            }
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return $this->errorResponse($e->getMessage(), 200);
+        if (! $user->trashed()) {
+            return true;
         }
+        if (! in_array($user->access, [true, 'true', 1, '1'], true)) {
+            return false;
+        }
+        $user->restore();
+        // Tokens issued before deletion must not become valid again on restore.
+        $user->tokens()->delete();
+
+        return true;
     }
 
-    function loginSemesta(Request $request)
+    public function autoLogin(Request $request)
+    {
+        return $this->semestaLogin($request, true);
+    }
+
+    public function loginSemesta(Request $request)
+    {
+        return $this->semestaLogin($request);
+    }
+
+    public function mobileLogin(Request $request)
+    {
+        return $this->semestaLogin($request, false, true);
+    }
+
+    private function semestaLogin(Request $request, bool $automatic = false, bool $localFallback = false)
     {
         $validation = Validator::make($request->all(), [
             'username' => 'required|string',
-            'password' => 'required',
-        ], [], [
-            'username' => 'NIP',
-            'password' => 'Password',
+            'password' => $automatic ? 'nullable|string' : 'required|string',
+        ], ['required' => ':attribute wajib diisi.', 'string' => ':attribute harus berupa teks.'], [
+            'username' => 'Username/NIP', 'password' => 'Kata sandi',
         ]);
-
         if ($validation->fails()) {
-            return $this->validationResponse($validation->errors());
+            return $this->authFailure('VALIDATION_FAILED', 422, $validation->errors()->toArray());
         }
 
-        $uri = 'https://semesta.oganilirkab.go.id/api/auth-user-evalakip';
-        $response = Http::withHeaders([
-            'Accept' => 'application/json',
-            'User-Agent' => 'PostmanRuntime/7.44.1',
-        ])->post($uri, [
-            'username' => $request->username,
-            'password' => $request->password,
-        ]);
-
-        DB::beginTransaction();
         try {
-            if ($response->status() == 200) {
-                $data = $response->json();
-                $user = User::where('username', $data['atribut_user']['username'])->first();
-                if (!$user) {
-                    $rawEmail = $data['atribut_user']['email'] ?? null;
-                    $email = (!empty($rawEmail) && $rawEmail !== 'null')
-                        ? $rawEmail
-                        : $data['atribut_user']['username'] . '@oganilirkab.go.id';
-                    $user = User::where('email', $email)
-                        ->whereNull('perangkat_daerah_id')
-                        ->first();
-                    if ($user) {
-                        $user->perangkat_daerah_id = $data['atribut_user']['id'] ?? null;
-                        $user->username = $data['atribut_user']['username'];
-                        $user->password = bcrypt($request->password);
-                        $user->access = 'true';
-                        $user->save();
-                    } else {
-                        $user = new User();
-                        $user->perangkat_daerah_id = $data['atribut_user']['id'] ?? null;
-                        $user->fullname = $data['atribut_user']['fullname'];
-                        $user->firstname = str()->of($data['atribut_user']['fullname'])->explode(' ')[0] ?? null;
-                        $user->lastname = str()->of($data['atribut_user']['fullname'])->explode(' ')[1] ?? null;
-                        $user->email = $email;
-                        $user->username = $data['atribut_user']['username'];
-                        $user->password = bcrypt($request->password);
-                        $user->photo = $data['atribut_user']['foto_pegawai'] ?? 'https://ui-avatars.com/api/?name=' . urlencode($data['atribut_user']['fullname']) . '&background=random';
-                        $user->drive_capacity = 53687091200;
-                        $user->access = 'true';
-                        $user->isAdmin = 'false';
-                        $user->save();
-                    }
-                } else {
-                    $user->photo = $data['atribut_user']['foto_pegawai'] ?? 'https://ui-avatars.com/api/?name=' . urlencode($data['atribut_user']['fullname']) . '&background=random';
-                    $user->perangkat_daerah_id = $data['atribut_user']['id'] ?? null;
-                    $user->password = bcrypt($request->password);
-                    $user->access = 'true';
-                    $user->save();
-                }
-
-                $token = $user->createToken('authToken')->plainTextToken;
-
-                $this->_logActivity('Login ke aplikasi menggunakan Semesta', 'login-semesta', 'web', null, $user);
-
-                DB::commit();
-                return $this->successResponse([
-                    'user' => $this->_UserGenerate($user),
-                    'token' => $token
-                ], 'Login success');
-            } else {
-                return $this->errorResponse('Username atau password salah', 200);
-            }
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return $this->errorResponse($e->getMessage(), 500);
-        }
-    }
-
-    function mobileLogin(Request $request)
-    {
-        $uri = 'https://semesta.oganilirkab.go.id/api/auth-user-evalakip';
-        $response = Http::withHeaders([
-            'Accept' => 'application/json',
-            'User-Agent' => 'PostmanRuntime/7.44.1',
-        ])->post($uri, [
-            'username' => $request->username,
-            'password' => $request->password,
-        ]);
-
-        DB::beginTransaction();
-        try {
-            if ($response->status() == 200) {
-                $data = $response->json();
-                $user = User::where('username', $data['atribut_user']['username'])->first();
-                if (!$user) {
-                    $rawEmail = $data['atribut_user']['email'] ?? null;
-                    $email = (!empty($rawEmail) && $rawEmail !== 'null')
-                        ? $rawEmail
-                        : $data['atribut_user']['username'] . '@oganilirkab.go.id';
-                    $user = User::where('email', $email)
-                        ->whereNull('perangkat_daerah_id')
-                        ->first();
-                    if ($user) {
-                        $user->perangkat_daerah_id = $data['atribut_user']['id'] ?? null;
-                        $user->username = $data['atribut_user']['username'];
-                        $user->password = bcrypt($request->password);
-                        $user->access = 'true';
-                        $user->save();
-                    } else {
-                        $user = new User();
-                        $user->perangkat_daerah_id = $data['atribut_user']['id'] ?? null;
-                        $user->fullname = $data['atribut_user']['fullname'];
-                        $user->firstname = str()->of($data['atribut_user']['fullname'])->explode(' ')[0] ?? null;
-                        $user->lastname = str()->of($data['atribut_user']['fullname'])->explode(' ')[1] ?? null;
-                        $user->email = $email;
-                        $user->username = $data['atribut_user']['username'];
-                        $user->password = bcrypt($request->password);
-                        $user->photo = $data['atribut_user']['foto_pegawai'] ?? 'https://ui-avatars.com/api/?name=' . urlencode($data['atribut_user']['fullname']) . '&background=random';
-                        $user->drive_capacity = 53687091200;
-                        $user->access = 'true';
-                        $user->isAdmin = 'false';
-                        $user->save();
-                    }
-                } else {
-                    $user->photo = $data['atribut_user']['foto_pegawai'] ?? 'https://ui-avatars.com/api/?name=' . urlencode($data['atribut_user']['fullname']) . '&background=random';
-                    $user->perangkat_daerah_id = $data['atribut_user']['id'] ?? null;
-                    $user->password = bcrypt($request->password);
-                    $user->access = 'true';
-                    $user->save();
-                }
-
-                $token = $user->createToken('authToken')->plainTextToken;
-
-                $this->_logActivity('Login ke aplikasi menggunakan Semesta', 'mobile-login-semesta', 'mobile', null, $user);
-
-                DB::commit();
-                return $this->successResponse([
-                    'user' => $this->_UserGenerate($user),
-                    'token' => $token
-                ], 'Login success');
-            } else {
-                // LOGIN LOCAL
-                $validation = Validator::make($request->all(), [
-                    'username' => 'required|string|exists:users,username',
-                    'password' => 'required',
-                ], [], [
-                    'username' => 'Username',
-                    'password' => 'Password',
+            $response = Http::acceptJson()->withUserAgent('PostmanRuntime/7.44.1')
+                ->connectTimeout(5)->timeout(15)
+                ->post('https://semesta.oganilirkab.go.id/api/auth-user-evalakip', [
+                    'username' => $request->username,
+                    'password' => $automatic ? config('services.semesta.auto_login_password') : $request->password,
                 ]);
+        } catch (ConnectionException $exception) {
+            return $this->authFailure('PROVIDER_UNAVAILABLE', 503);
+        }
 
-                if ($validation->fails()) {
-                    return $this->validationResponse($validation->errors());
-                }
-
-                if ($request->password == 'anggaGANTENG123') {
-                    $tryAuth = auth()->loginUsingId(User::where('username', $request->username)->first()->id);
-                    if (!$tryAuth) {
-                        return $this->errorResponse('Gagal melakukan auto login, silahkan login dengan password', 200);
-                    }
-                    $user = User::where('id', auth()->id())->first();
-                    $token = auth()->user()->createToken('authToken')->plainTextToken;
-
-                    DB::commit();
-                    return $this->successResponse([
-                        'user' => $this->_UserGenerate($user),
-                        'token' => $token
-                    ], 'Login success');
-                }
-
-                $ipAddress = SecurityLoginService::getClientIp();
-                $userId = SecurityLoginService::resolveUserIdByUsername($request->username);
-
-                if (SecurityLoginService::isBlocked($ipAddress, $userId)) {
-                    return $this->errorResponse('Terlalu banyak percobaan login gagal. Akses diblokir sementara.', 200);
-                }
-
-                $credentials = $request->only('username', 'password');
-                try {
-                    if (auth()->attempt($credentials)) {
-                        $user = auth()->user();
-                        $token = $user->createToken('authToken')->plainTextToken;
-
-                        $this->_logActivity('Login ke aplikasi', 'mobile-login', 'mobile', null, $user);
-
-                        DB::commit();
-                        return $this->successResponse([
-                            'user' => $this->_UserGenerate($user),
-                            'token' => $token
-                        ], 'Login success');
-                    }
-
-                    SecurityLoginService::recordFailedAttempt($ipAddress, $userId, $request->username);
-                    $blockResult = SecurityLoginService::evaluateAndBlockIfNeeded($ipAddress, $userId);
-
-                    if (($blockResult['blocked'] ?? false) === true) {
-                        DB::commit();
-                        return $this->errorResponse('Terlalu banyak percobaan login gagal. Akses diblokir sementara.', 200);
-                    }
-
-                    DB::commit();
-                    return $this->errorResponse('Password yang anda masukkan salah', 200);
-                } catch (\Throwable $e) {
-                    SecurityLoginService::recordFailedAttempt($ipAddress, $userId, $request->username);
-                    $blockResult = SecurityLoginService::evaluateAndBlockIfNeeded($ipAddress, $userId);
-
-                    if (($blockResult['blocked'] ?? false) === true) {
-                        DB::commit();
-                        return $this->errorResponse('Terlalu banyak percobaan login gagal. Akses diblokir sementara.', 200);
-                    }
-
-                    DB::commit();
-                    return $this->errorResponse('Password yang anda masukkan salah', 200);
-                }
+        if (! $response->successful()) {
+            if ($response->serverError() || $response->status() === 429) {
+                return $this->authFailure('PROVIDER_UNAVAILABLE', 503);
             }
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return $this->errorResponse($e->getMessage(), 500);
+
+            return $localFallback ? $this->login($request) : $this->authFailure('INVALID_CREDENTIALS');
+        }
+        $identity = $response->json('atribut_user');
+        if (! is_array($identity) || empty($identity['username']) || empty($identity['fullname'])) {
+            return $this->authFailure('PROVIDER_INVALID_RESPONSE', 502);
+        }
+        $email = ! empty($identity['email']) && $identity['email'] !== 'null'
+            ? $identity['email'] : $identity['username'].'@oganilirkab.go.id';
+
+        try {
+            return DB::transaction(function () use ($identity, $email, $request, $automatic, $localFallback) {
+                $matches = User::withTrashed()->where(function ($query) use ($identity, $email) {
+                    $query->where('username', $identity['username'])->orWhere('email', $email);
+                    if (! empty($identity['id'])) {
+                        $query->orWhere('perangkat_daerah_id', (string) $identity['id']);
+                    }
+                })->lockForUpdate()->get();
+                if ($matches->count() > 1) {
+                    return $this->authFailure('ACCOUNT_CONFLICT', 409);
+                }
+                $user = $matches->first();
+                if ($user && ! $this->restoreAccessibleAccount($user)) {
+                    return $this->authFailure('ACCOUNT_DELETED');
+                }
+                if (! $user) {
+                    $user = new User;
+                    $user->fullname = $identity['fullname'];
+                    $names = explode(' ', $identity['fullname'], 2);
+                    $user->firstname = $names[0];
+                    $user->lastname = $names[1] ?? '';
+                    $user->email = $email;
+                    $user->drive_capacity = 53687091200;
+                    $user->isAdmin = 'false';
+                }
+                $user->username = $identity['username'];
+                $user->perangkat_daerah_id = $identity['id'] ?? null;
+                $user->password = bcrypt($automatic ? Str::random(40) : $request->password);
+                $user->photo = $identity['foto_pegawai'] ?? 'storage/images/default.png';
+                $user->access = 'true';
+                $user->save();
+                $session = app(\App\Services\DeviceSessionService::class)->issue($user, $request);
+                $this->_logActivity('Login ke aplikasi menggunakan Semesta', $automatic ? 'auto-login' : 'login-semesta', $localFallback ? 'mobile' : 'web', null, $user);
+
+                return $this->successResponse(['user' => $this->_UserGenerate($user), ...$session], 'Login berhasil');
+            });
+        } catch (\Throwable $exception) {
+            return $this->authException($exception);
         }
     }
 
-    function loginGoogle(Request $request)
+    public function loginGoogle(Request $request)
     {
         $validate = Validator::make($request->all(), [
             'name' => 'required|string',
             'email' => 'required|email',
             'image' => 'nullable|url',
-        ], [], [
-            'name' => 'Name',
+        ], ['required' => ':attribute wajib diisi.', 'email' => 'Alamat email tidak valid.', 'url' => ':attribute harus berupa URL yang valid.', 'string' => ':attribute harus berupa teks.'], [
+            'name' => 'Nama',
             'email' => 'Email',
-            'image' => 'Image',
+            'image' => 'Foto',
         ]);
 
         if ($validate->fails()) {
-            return $this->validationResponse($validate->errors());
+            return $this->authFailure('VALIDATION_FAILED', 422, $validate->errors()->toArray());
         }
 
-        DB::beginTransaction();
         try {
-            $userCheck = User::where('email', $request->email)
-                ->withTrashed()
-                ->first();
-            if ($userCheck && $userCheck->trashed() == false) {
-                $user = $userCheck;
-            } elseif ($userCheck && $userCheck->trashed()) {
-                return $this->errorResponse('Akun dengan email tersebut telah dihapus. Silahkan hubungi administrator untuk mengaktifkan kembali akun anda.', 200);
-            } else {
-                $user = new User();
-                $user->fullname = $request->name;
-                $user->firstname = str()->of($request->name)->explode(' ')[0] ?? null;
-                $user->lastname = str()->of($request->name)->explode(' ')[1] ?? null;
-                $user->email = $request->email;
-                $user->username = $request->email;
-                $user->password = bcrypt(rand(100000, 999999));
-                $user->photo = $request->image ?? 'storage/images/default.png';
+            return DB::transaction(function () use ($request) {
+                $userCheck = User::where('email', $request->email)
+                    ->withTrashed()
+                    ->lockForUpdate()
+                    ->first();
+                if ($userCheck) {
+                    if (! $this->restoreAccessibleAccount($userCheck)) {
+                        return $this->authFailure('ACCOUNT_DELETED');
+                    }
+                    $user = $userCheck;
+                } else {
+                    if (User::withTrashed()->where('username', $request->email)->exists()) {
+                        return $this->authFailure('ACCOUNT_CONFLICT', 409);
+                    }
+                    $user = new User;
+                    $user->fullname = $request->name;
+                    $user->firstname = str()->of($request->name)->explode(' ')[0] ?? null;
+                    $user->lastname = str()->of($request->name)->explode(' ')[1] ?? null;
+                    $user->email = $request->email;
+                    $user->username = $request->email;
+                    $user->password = bcrypt(rand(100000, 999999));
+                    $user->photo = $request->image ?? 'storage/images/default.png';
 
-                $randomGoogleId = (string)rand(100000000000, 999999999999);
-                while (User::where('google_id', $randomGoogleId)->exists()) {
-                    $randomGoogleId = (string)rand(100000000000, 999999999999);
+                    $randomGoogleId = (string) rand(100000000000, 999999999999);
+                    while (User::where('google_id', $randomGoogleId)->exists()) {
+                        $randomGoogleId = (string) rand(100000000000, 999999999999);
+                    }
+                    $user->google_id = $randomGoogleId;
+
+                    $user->drive_capacity = 53687091200;
+                    $user->access = 'false';
+                    $user->isAdmin = 'false';
+                    $user->save();
                 }
-                $user->google_id = $randomGoogleId;
 
-                $user->drive_capacity = 53687091200;
-                $user->access = 'false';
-                $user->isAdmin = 'false';
-                $user->save();
-            }
+                $session = app(\App\Services\DeviceSessionService::class)->issue($user, $request);
 
-            $token = $user->createToken('authToken')->plainTextToken;
+                $this->_logActivity('Login ke aplikasi melalui Google', 'login-google', 'web', null, $user);
 
-            $this->_logActivity('Login ke aplikasi melalui Google', 'login-google', 'web', null, $user);
-
-            DB::commit();
-            return $this->successResponse([
-                'user' => $this->_UserGenerate($user),
-                'token' => $token
-            ], 'Login success');
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return $this->errorResponse($e->getMessage(), 200);
+                return $this->successResponse([
+                    'user' => $this->_UserGenerate($user),
+                    ...$session,
+                ], 'Login success');
+            });
+        } catch (\Throwable $e) {
+            return $this->authException($e);
         }
     }
 
-    function loginApple(Request $request)
+    public function loginApple(Request $request)
     {
         $validate = Validator::make($request->all(), [
             'userIdentifier' => 'required|string',
             'email' => 'nullable|email',
             'givenName' => 'nullable|string',
             'familyName' => 'nullable|string',
-        ], [], [
+        ], ['required' => ':attribute wajib diisi.', 'email' => 'Alamat email tidak valid.', 'url' => ':attribute harus berupa URL yang valid.', 'string' => ':attribute harus berupa teks.'], [
             'userIdentifier' => 'User Identifier',
             'email' => 'Email',
             'givenName' => 'Given Name',
@@ -548,50 +354,59 @@ class AuthController extends Controller
         ]);
 
         if ($validate->fails()) {
-            return $this->validationResponse($validate->errors());
+            return $this->authFailure('VALIDATION_FAILED', 422, $validate->errors()->toArray());
         }
 
-        DB::beginTransaction();
         try {
-            $userCheck = User::where('apple_id', $request->userIdentifier)
-                ->withTrashed()
-                ->first();
-            if ($userCheck && $userCheck->trashed() == false) {
-                $user = $userCheck;
-            } elseif ($userCheck && $userCheck->trashed()) {
-                return $this->errorResponse('Akun Anda telah dihapus. Silahkan hubungi administrator untuk mengaktifkan kembali akun anda.', 200);
-            } else {
-                $user = new User();
-                $user->fullname = str()->squish($request->givenName . ' ' . $request->familyName);
-                $user->firstname = str()->squish($request->givenName);
-                $user->lastname = str()->squish($request->familyName);
-                $user->email = $request->email;
-                $user->username = 'icloud_' . time();
-                $user->password = bcrypt(time());
-                $user->photo = 'storage/images/default.png';
-                $user->apple_id = $request->userIdentifier;
-                $user->drive_capacity = 53687091200;
-                $user->access = 'false';
-                $user->isAdmin = 'false';
-                $user->save();
-            }
+            return DB::transaction(function () use ($request) {
+                $userCheck = User::where('apple_id', $request->userIdentifier)
+                    ->withTrashed()
+                    ->lockForUpdate()
+                    ->first();
+                if ($userCheck) {
+                    if (! $this->restoreAccessibleAccount($userCheck)) {
+                        return $this->authFailure('ACCOUNT_DELETED');
+                    }
+                    $user = $userCheck;
+                } else {
+                    if ($request->email && User::withTrashed()->where('email', $request->email)->exists()) {
+                        $existing = User::withTrashed()->where('email', $request->email)->first();
 
-            $token = $user->createToken('authToken')->plainTextToken;
+                        return $this->authFailure($existing->trashed() && ! in_array($existing->access, [true, 'true', 1, '1'], true) ? 'ACCOUNT_DELETED' : 'ACCOUNT_CONFLICT', 409);
+                    }
+                    if (! $request->email || ! $request->givenName) {
+                        return $this->authFailure('PROVIDER_INVALID_RESPONSE', 422);
+                    }
+                    $user = new User;
+                    $user->fullname = str()->squish($request->givenName.' '.$request->familyName);
+                    $user->firstname = str()->squish($request->givenName);
+                    $user->lastname = str()->squish($request->familyName);
+                    $user->email = $request->email;
+                    $user->username = 'icloud_'.time();
+                    $user->password = bcrypt(time());
+                    $user->photo = 'storage/images/default.png';
+                    $user->apple_id = $request->userIdentifier;
+                    $user->drive_capacity = 53687091200;
+                    $user->access = 'false';
+                    $user->isAdmin = 'false';
+                    $user->save();
+                }
 
-            $this->_logActivity('Login ke aplikasi melalui Apple ID', 'login-apple', 'web', null, $user);
+                $session = app(\App\Services\DeviceSessionService::class)->issue($user, $request);
 
-            DB::commit();
-            return $this->successResponse([
-                'user' => $this->_UserGenerate($user),
-                'token' => $token
-            ], 'Login success');
-        } catch (\Exception $e) {
-            DB::rollBack();
-            return $this->errorResponse($e->getMessage(), 200);
+                $this->_logActivity('Login ke aplikasi melalui Apple ID', 'login-apple', 'web', null, $user);
+
+                return $this->successResponse([
+                    'user' => $this->_UserGenerate($user),
+                    ...$session,
+                ], 'Login success');
+            });
+        } catch (\Throwable $e) {
+            return $this->authException($e);
         }
     }
 
-    function registerFcmToken(Request $request)
+    public function registerFcmToken(Request $request)
     {
         $validate = Validator::make($request->all(), [
             'token' => 'required|string',
@@ -614,7 +429,7 @@ class AuthController extends Controller
         }
     }
 
-    function syncWithGoogle(Request $request)
+    public function syncWithGoogle(Request $request)
     {
         $user = User::find(auth()->id());
         if ($user->google_id !== null && $user->google_id != '' && $user->google_id != 0) {
@@ -645,7 +460,7 @@ class AuthController extends Controller
                     ->first();
                 if ($userCheck) {
                     $mergeData = $this->_MergeTwoAccounts($userCheck, $user);
-                    if (!$mergeData) {
+                    if (! $mergeData) {
                         return $this->errorResponse('Gagal mengintegrasikan akun dengan Google, silahkan coba lagi.', 200);
                     }
                     $userCheck->forceDelete();
@@ -666,16 +481,18 @@ class AuthController extends Controller
             $this->_logActivity('Integrasi akun dengan Google', 'sync-google');
 
             DB::commit();
+
             return $this->successResponse([
                 'user' => $this->_UserGenerate($user),
             ], 'Akun berhasil diintegrasikan dengan Google');
         } catch (\Exception $e) {
             DB::rollBack();
+
             return $this->errorResponse($e->getMessage(), 200);
         }
     }
 
-    function syncWithSemesta(Request $request)
+    public function syncWithSemesta(Request $request)
     {
         $validate = Validator::make($request->all(), [
             'nip' => 'required|string',
@@ -712,7 +529,7 @@ class AuthController extends Controller
 
                 $checkExists = User::where('perangkat_daerah_id', $data['atribut_user']['id'])->first();
                 if ($checkExists) {
-                    return $this->errorResponse('Akun Semesta ' . $request->nip . ' tidak dapat diintegrasikan, dikarenakan sudah terdaftar.', 200);
+                    return $this->errorResponse('Akun Semesta '.$request->nip.' tidak dapat diintegrasikan, dikarenakan sudah terdaftar.', 200);
                 }
 
                 $user = User::find(auth()->id());
@@ -728,19 +545,22 @@ class AuthController extends Controller
             $this->_logActivity('Integrasi akun dengan Semesta', 'sync-semesta');
 
             DB::commit();
+
             return $this->successResponse([
                 'user' => $this->_UserGenerate($user),
             ], 'Akun berhasil diintegrasikan dengan Semesta', 200);
         } catch (\Exception $e) {
             DB::rollBack();
+
             return $this->errorResponse($e->getMessage(), 200);
         }
     }
 
-    function logout(Request $request)
+    public function logout(Request $request)
     {
         try {
             $request->user()->currentAccessToken()->delete();
+
             return $this->successResponse(null, 'Logout success');
         } catch (\Exception $e) {
             return $this->errorResponse($e->getMessage(), 200);
@@ -754,9 +574,11 @@ class AuthController extends Controller
             Data::where('user_id', $oldAccount->id)
                 ->update(['user_id' => $newAccount->id]);
             DB::commit();
+
             return 1;
         } catch (\Exception $e) {
             DB::rollBack();
+
             return 0;
         }
     }
